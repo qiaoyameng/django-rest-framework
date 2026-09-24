@@ -431,6 +431,20 @@ To serialize a queryset or list of objects instead of a single object instance, 
 
 The default behavior for deserializing multiple objects is to support multiple object creation, but not support multiple object updates. For more information on how to support or customize either of these cases, see the [ListSerializer](#listserializer) documentation below.
 
+### Selecting output fields
+
+You can limit a read operation to a subset of fields by passing a list of public field names as the `fields` argument.
+Nested fields are addressed with dotted paths, including `many=True` serializers:
+
+    serializer = BookSerializer(book, fields=['title', 'author.email', 'comments.author'])
+    serializer.data
+    # {'title': '...', 'author': {'email': '...'}, 'comments': [{'author': {...}}]}
+
+If both a parent field and one of its descendants are selected, the parent takes precedence and its complete representation is included.
+Field paths use serializer field names, never the field's internal `source`.
+Unknown or write-only field paths raise an error when the serializer is instantiated.
+The projection only affects `.data`; deserialization, `required`, validators, and class-level fields remain unchanged.
+
 ### Including extra context
 
 There are some cases where you need to provide extra context to the serializer in addition to the object being serialized.  One common case is if you're using a serializer that includes hyperlinked relations, which requires the serializer to have access to the current request so that it can properly generate fully qualified URLs.

@@ -81,6 +81,7 @@ LIST_SERIALIZER_KWARGS = (
 LIST_SERIALIZER_KWARGS_REMOVE = ('allow_empty', 'min_length', 'max_length')
 
 ALL_FIELDS = '__all__'
+ALL_OUTPUT_FIELDS = object()
 
 
 # BaseSerializer
@@ -117,8 +118,94 @@ class BaseSerializer(Field):
             self.initial_data = data
         self.partial = kwargs.pop('partial', False)
         self._context = kwargs.pop('context', {})
+        fields = kwargs.pop('fields', None)
         kwargs.pop('many', None)
         super().__init__(**kwargs)
+        self._set_output_fields(fields)
+
+    @property
+    def _output_fields_schema(self):
+        return self
+
+    def _set_output_fields(self, fields):
+        self._output_fields = self._parse_output_fields(fields)
+
+    def _configure_output_fields(self, projection):
+        self._output_fields = projection
+
+    def _parse_output_fields(self, fields):
+        if fields is None:
+            return None
+
+        if isinstance(fields, (str, bytes)) or not isinstance(fields, (list, tuple)):
+            raise TypeError(
+                'The `fields` argument must be a list or tuple of field paths.'
+            )
+
+        projection = {}
+
+        def add_path(node, field_names):
+            if ALL_OUTPUT_FIELDS in node:
+                return
+
+            field_name = field_names[0]
+            if len(field_names) == 1:
+                node[field_name] = {ALL_OUTPUT_FIELDS: None}
+                return
+
+            child_node = node.setdefault(field_name, {})
+            if ALL_OUTPUT_FIELDS not in child_node:
+                add_path(child_node, field_names[1:])
+
+        for field_path in fields:
+            if not isinstance(field_path, str):
+                raise TypeError(
+                    'Field paths passed to `fields` must be strings.'
+                )
+
+            field_names = field_path.split('.')
+            self._validate_output_field_path(field_names)
+            add_path(projection, field_names)
+
+        return projection
+
+    def _validate_output_field_path(self, field_names):
+        serializer = self._output_fields_schema
+
+        for index, field_name in enumerate(field_names):
+            try:
+                field = serializer.fields[field_name]
+            except KeyError:
+                raise ValueError(
+                    f'Unknown field `{field_name}` in serializer '
+                    f'`{serializer.__class__.__name__}`.'
+                )
+
+            if field.write_only:
+                raise ValueError(
+                    f'Field `{field_name}` on serializer '
+                    f'`{serializer.__class__.__name__}` is write-only and '
+                    'cannot be included in output fields.'
+                )
+
+            if index < len(field_names) - 1:
+                nested_serializer = getattr(field, 'child', field)
+                if not isinstance(nested_serializer, Serializer):
+                    raise ValueError(
+                        f'Field `{field_name}` on serializer '
+                        f'`{serializer.__class__.__name__}` does not support '
+                        'nested output fields.'
+                    )
+                serializer = nested_serializer
+
+    def _apply_output_fields(self, field, projection):
+        if ALL_OUTPUT_FIELDS in projection:
+            selected_fields = None
+        else:
+            selected_fields = projection
+
+        if isinstance(field, BaseSerializer):
+            field._configure_output_fields(selected_fields)
 
     def __new__(cls, *args, **kwargs):
         # We override this method in order to automatically create
@@ -153,11 +240,14 @@ class BaseSerializer(Field):
             value = kwargs.pop(key, None)
             if value is not None:
                 list_kwargs[key] = value
+        fields = kwargs.pop('fields', None)
         list_kwargs['child'] = cls(*args, **kwargs)
         list_kwargs.update({
             key: value for key, value in kwargs.items()
             if key in LIST_SERIALIZER_KWARGS
         })
+        if fields is not None:
+            list_kwargs['fields'] = fields
         meta = getattr(cls, 'Meta', None)
         list_serializer_class = getattr(meta, 'list_serializer_class', ListSerializer)
         return list_serializer_class(*args, **list_kwargs)
@@ -533,8 +623,18 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
         """
         ret = {}
         fields = self._readable_fields
+        projection = getattr(self, '_output_fields', None)
+
+        if projection is not None:
+            fields = (
+                field for field in fields
+                if field.field_name in projection
+            )
 
         for field in fields:
+            if projection is not None:
+                self._apply_output_fields(field, projection[field.field_name])
+
             try:
                 attribute = field.get_attribute(instance)
             except SkipField:
@@ -602,6 +702,19 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
 class ListSerializer(BaseSerializer):
     child = None
     many = True
+
+    @property
+    def _output_fields_schema(self):
+        return self.child
+
+    def _set_output_fields(self, fields):
+        super()._set_output_fields(fields)
+        if fields is not None:
+            self.child._output_fields = self._output_fields
+
+    def _configure_output_fields(self, projection):
+        super()._configure_output_fields(projection)
+        self.child._output_fields = projection
 
     default_error_messages = {
         'not_a_list': _('Expected a list of items but got type "{input_type}".'),
