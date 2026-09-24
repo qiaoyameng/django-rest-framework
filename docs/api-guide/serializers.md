@@ -1151,6 +1151,39 @@ This would then allow you to do the following:
     >>> print(UserSerializer(user, fields=('id', 'email')))
     {'id': 2, 'email': 'jon@example.com'}
 
+### Projecting output fields with `only`
+
+Serializers also accept a built-in `only` argument that restricts the
+*output* representation to an explicit set of field paths:
+
+    >>> class AuthorSerializer(serializers.Serializer):
+    ...     name = serializers.CharField()
+    ...     email = serializers.CharField()
+    >>>
+    >>> class BookSerializer(serializers.Serializer):
+    ...     title = serializers.CharField()
+    ...     author = AuthorSerializer()
+    >>>
+    >>> BookSerializer(book, only=('title', 'author.email')).data
+    {'title': 'The Left Hand of Darkness', 'author': {'email': 'ursula@example.com'}}
+
+Field paths use the public field names as declared on the serializer, never
+the internal `source` attribute names. Dotted paths select sub-fields of
+nested serializers, including nested serializers using `many=True`. If a
+field and one of its sub-paths are both given, the bare field name wins and
+the whole field is included.
+
+Projection only affects serialization output. Fields that are not selected
+never perform attribute access and never run `SerializerMethodField`
+methods, which makes `only` useful for expensive read-only endpoints.
+Deserialization is unaffected: `required`, validators and `.validated_data`
+behave exactly as if no projection was given.
+
+Unknown field paths raise `ImproperlyConfigured` before any serialization
+takes place. The projection is stored per instance, so concurrent
+serializers of the same class may use different projections, and class-level
+field definitions are never modified.
+
 ### Customizing the default fields
 
 REST framework 2 provided an API to allow developers to override how a `ModelSerializer` class would automatically generate the default set of fields.

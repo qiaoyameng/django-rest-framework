@@ -83,6 +83,70 @@ LIST_SERIALIZER_KWARGS_REMOVE = ('allow_empty', 'min_length', 'max_length')
 ALL_FIELDS = '__all__'
 
 
+def _parse_projection(paths):
+    """
+    Parse an iterable of dotted field paths into a projection tree.
+
+    The tree maps each selected public field name to either `None`, meaning
+    the field is fully selected, or to a nested dict of sub-field projections.
+
+    Merge rule: a bare field name selects the field and everything below it.
+    If a path and one of its descendants are both given, the shorter path
+    wins and the whole subtree is selected, regardless of ordering.
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+    tree = {}
+    for path in paths:
+        parts = path.split('.')
+        if not all(parts):
+            raise ImproperlyConfigured(
+                'Invalid empty field name in `only` projection path %r.' % (path,)
+            )
+        node = tree
+        for part in parts[:-1]:
+            existing = node.get(part)
+            if existing is None and part in node:
+                # A shorter path already selected this whole subtree.
+                node = None
+                break
+            if existing is None:
+                existing = node[part] = {}
+            node = existing
+        if node is not None:
+            # A bare path selects everything below it, replacing any more
+            # specific paths seen so far.
+            node[parts[-1]] = None
+    return tree
+
+
+def _validate_projection(tree, serializer, prefix=''):
+    """
+    Validate a projection tree against the public field names of a serializer,
+    raising `ImproperlyConfigured` for any unknown field path.
+    """
+    fields = serializer.fields
+    for name, subtree in tree.items():
+        path = prefix + name
+        if name not in fields:
+            raise ImproperlyConfigured(
+                'Unknown field "%s" in `only` projection for serializer %s. '
+                'Projection paths must use public field names, not `source` '
+                'attribute names.' % (path, serializer.__class__.__name__)
+            )
+        if subtree is None:
+            continue
+        field = fields[name]
+        child = field.child if isinstance(field, ListSerializer) else field
+        if not isinstance(child, Serializer):
+            raise ImproperlyConfigured(
+                'Cannot project sub-fields of "%s" in `only` projection for '
+                'serializer %s: "%s" is not a nested serializer.'
+                % (path, serializer.__class__.__name__, name)
+            )
+        _validate_projection(subtree, child, prefix=path + '.')
+
+
 # BaseSerializer
 # --------------
 
@@ -118,7 +182,14 @@ class BaseSerializer(Field):
         self.partial = kwargs.pop('partial', False)
         self._context = kwargs.pop('context', {})
         kwargs.pop('many', None)
+        self._only = kwargs.pop('only', None)
         super().__init__(**kwargs)
+
+    def _set_projection_tree(self, tree):
+        raise ImproperlyConfigured(
+            'Output field projection with `only` is not supported by %s.'
+            % self.__class__.__name__
+        )
 
     def __new__(cls, *args, **kwargs):
         # We override this method in order to automatically create
@@ -395,9 +466,41 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
 
     @property
     def _readable_fields(self):
+        projection = self._projection
         for field in self.fields.values():
-            if not field.write_only:
-                yield field
+            if field.write_only:
+                continue
+            if projection is not None:
+                if field.field_name not in projection:
+                    continue
+                subtree = projection[field.field_name]
+                if subtree is not None:
+                    # Apply the sub-projection to the nested serializer, so
+                    # that only the selected sub-fields are serialized. The
+                    # field instances here are per-instance copies, so this
+                    # never mutates class-level state.
+                    field._set_projection_tree(subtree)
+            yield field
+
+    @property
+    def _projection(self):
+        """
+        The parsed output projection tree for this instance, or `None` when
+        no `only` projection was requested. Validated lazily, on first use,
+        so that declaring serializers at import time stays cheap and unknown
+        field paths raise before any serialization takes place.
+        """
+        if not hasattr(self, '_projection_tree'):
+            if self._only is None:
+                self._projection_tree = None
+            else:
+                tree = _parse_projection(self._only)
+                _validate_projection(tree, self)
+                self._projection_tree = tree
+        return self._projection_tree
+
+    def _set_projection_tree(self, tree):
+        self._projection_tree = tree
 
     def get_fields(self):
         """
@@ -729,6 +832,14 @@ class ListSerializer(BaseSerializer):
         """
         List of object instances -> List of dicts of primitive datatypes.
         """
+        if self._only is not None:
+            # An `only` projection passed directly to a `ListSerializer`
+            # applies to each item, through the child serializer.
+            tree = _parse_projection(self._only)
+            _validate_projection(tree, self.child)
+            self.child._set_projection_tree(tree)
+            self._only = None
+
         # Dealing with nested relationships, data can be a Manager,
         # so, first get a queryset from the Manager if needed
         iterable = data.all() if isinstance(data, models.manager.BaseManager) else data
@@ -739,6 +850,10 @@ class ListSerializer(BaseSerializer):
 
     def validate(self, attrs):
         return attrs
+
+    def _set_projection_tree(self, tree):
+        # A projection on a list applies to each item in the list.
+        self.child._set_projection_tree(tree)
 
     def update(self, instance, validated_data):
         raise NotImplementedError(
