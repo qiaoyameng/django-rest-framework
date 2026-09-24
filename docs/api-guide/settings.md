@@ -97,6 +97,8 @@ A content negotiation class, that determines how a renderer is selected for the 
 
 Default: `'rest_framework.negotiation.DefaultContentNegotiation'`
 
+See also the [parameter-aware content negotiation](content-negotiation.md#parameter-aware-content-negotiation) scheme, which takes media type parameters and `q` weightings into account.
+
 #### DEFAULT_SCHEMA_CLASS
 
 A view inspector class that will be used for schema generation.

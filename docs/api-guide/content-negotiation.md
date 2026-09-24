@@ -38,6 +38,46 @@ For more information on the `HTTP Accept` header, see [RFC 2616][accept-header]
 
     This is a valid approach as the HTTP spec deliberately underspecifies how a server should weight server-based preferences against client-based preferences.
 
+## Parameter-aware content negotiation
+
+The default negotiation scheme described above ignores both `q` weightings and media type parameters.  If you need to serve multiple parameterized representations of the same media type - for example `application/json; profile="compact"` and `application/json; profile="full"` from a single endpoint - you can opt into the parameter-aware scheme by using `ParameterAwareContentNegotiation`, either globally or per view:
+
+    from rest_framework.negotiation import ParameterAwareContentNegotiation
+    from rest_framework.renderers import JSONRenderer
+    from rest_framework.response import Response
+    from rest_framework.views import APIView
+
+    class CompactProfileRenderer(JSONRenderer):
+        media_type = 'application/json; profile=compact'
+        format = 'json-compact'
+
+    class FullProfileRenderer(JSONRenderer):
+        media_type = 'application/json; profile=full'
+        format = 'json-full'
+
+    class ProfileView(APIView):
+        content_negotiation_class = ParameterAwareContentNegotiation
+        renderer_classes = [CompactProfileRenderer, FullProfileRenderer]
+
+        def get(self, request):
+            return Response({'example': 'data'})
+
+Renderers declare the media type parameters they require, either by including them in their `.media_type` attribute, or by setting a `.required_media_type_params` dictionary, such as `required_media_type_params = {'profile': 'compact'}`.  Declaring the parameters in `.media_type` is recommended, because the response `Content-Type` header is built from the renderer's `.media_type`, ensuring it always corresponds to the representation that is actually returned.
+
+The scheme behaves as follows:
+
+* Each media range in the `Accept` header is weighted by its `q` value, defaulting to `q=1`.  The renderer matched by the highest weighted media range is selected.  When a renderer matches several media ranges, the most specific range determines its weight, where exact types are more specific than `type/*` wildcards, which are more specific than `*/*`.
+* A media range that specifies a parameter only matches renderers that require the same parameter value, or that do not require the parameter at all.  A media range without parameters, such as `application/json` or `*/*`, matches renderers requiring any parameter values.
+* Parameter ordering and the case of the media type do not affect matching, and quoted parameter values are parsed correctly, including values containing commas such as `profile="a,b"`.  Parameter values themselves are compared case-sensitively.
+* Media ranges with `q=0` are treated as "not acceptable" and are never selected, even as a fallback.  For example, given `Accept: application/json; profile="compact"; q=0, application/json; q=0.8`, the `compact` renderer is excluded and the `full` renderer is selected.
+* When several renderers share the highest weight, the renderer listed first in `renderer_classes` wins, keeping the server-side ordering stable.
+* If no renderer is acceptable, a `406 Not Acceptable` response is returned.  The error response itself is rendered with the first configured renderer, as REST framework cannot determine an acceptable media type.
+* Media ranges that cannot be parsed are ignored.  If the `Accept` header is missing or contains no valid media ranges, the client is treated as accepting any media type, equivalent to `Accept: */*`.
+* Format suffixes and the `?format=` query parameter are applied before parameter negotiation, restricting the candidate renderers to those with a matching `.format` attribute, exactly as with the default scheme.  An unknown format raises `Http404`, which is converted into a `404 Not Found` response.
+* Exception responses are negotiated with the same rules, so an error response uses the same representation as a successful response would have, given the same `Accept` header.
+
+Any additional parameters supplied by the client that the renderer does not require, such as `indent=4`, are preserved in the accepted media type passed to the renderer's `.render()` method.
+
 ## Custom content negotiation
 
 It's unlikely that you'll want to provide a custom content negotiation scheme for REST framework, but you can do so if needed.  To implement a custom content negotiation scheme override `BaseContentNegotiation`.

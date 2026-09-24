@@ -45,6 +45,9 @@ class BaseRenderer:
     format = None
     charset = 'utf-8'
     render_style = 'text'
+    # Media type parameters this renderer requires, as a dictionary.
+    # Only used by `ParameterAwareContentNegotiation`.
+    required_media_type_params = {}
 
     def render(self, data, accepted_media_type=None, renderer_context=None):
         raise NotImplementedError('Renderer class requires .render() to be implemented')
