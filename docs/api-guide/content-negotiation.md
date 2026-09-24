@@ -38,6 +38,36 @@ For more information on the `HTTP Accept` header, see [RFC 2616][accept-header]
 
     This is a valid approach as the HTTP spec deliberately underspecifies how a server should weight server-based preferences against client-based preferences.
 
+## Parameter-aware content negotiation
+
+The default scheme described above does not distinguish between representations that share a media type but differ in media type *parameters*, such as `application/json; profile="compact"` and `application/json; profile="full"`.  If you need a single endpoint to serve several such representations, each backed by its own renderer, REST framework provides an opt-in `ParameterAwareContentNegotiation` class.
+
+    REST_FRAMEWORK = {
+        'DEFAULT_CONTENT_NEGOTIATION_CLASS':
+            'rest_framework.negotiation.ParameterAwareContentNegotiation',
+    }
+
+The default negotiation class is unchanged; the parameter-aware scheme is only used where you explicitly configure it, either globally via the setting above or per view via `content_negotiation_class`.
+
+Renderers declare their required parameters as part of their `media_type`:
+
+    class CompactProfileRenderer(JSONRenderer):
+        media_type = 'application/json; profile="compact"'
+        format = 'json-compact'
+
+    class FullProfileRenderer(JSONRenderer):
+        media_type = 'application/json; profile="full"'
+        format = 'json-full'
+
+The scheme behaves as follows:
+
+* **Parameter matching.** Parameters declared by the renderer participate in matching: `Accept: application/json; profile="full"` selects the full renderer and never the compact one.  Parameters sent by the client constrain the match, but renderer parameters absent from the client's media range do not prevent it, so plain `application/json` or `*/*` still match parameterized renderers as a fallback.  Matching is case-insensitive for the media type and parameter names, and insensitive to parameter order; quoted parameter values are unquoted before comparison, and quoted values containing commas (eg `profile="a,b"`) are tokenized correctly rather than being split into separate media ranges.
+* **Weighting.** Each renderer is scored with the `q` value of the *most specific* matching media range, where specificity is ordered by explicit main type, explicit subtype, then parameter count.  The highest-weighted renderer wins; ties are broken by stable server-side ordering (the renderer listed first in `renderer_classes`).  Media ranges with an unparseable `q` value are treated as `q=1`.
+* **Exclusions.** A renderer whose most specific matching media range has `q=0` is not acceptable and is *not* re-selected by a less specific fallback range such as `*/*`.  If no renderer is acceptable, a `406 Not Acceptable` response is returned, exactly as with the default scheme.
+* **Content-Type.** The response `Content-Type` is the selected renderer's declared `media_type`, so it always corresponds to the representation actually returned, including its parameters.
+* **Format overrides.** Format suffixes (eg `.json`) and the `?format=` query parameter behave as with the default scheme: they restrict the candidate renderers up front (raising `404` if none match), after which `Accept` header negotiation still applies to the remaining candidates.
+* **Exceptions.** Exception responses are rendered with the renderer negotiated for the request, so error responses honor the same parameter-aware negotiation as successful responses.
+
 ## Custom content negotiation
 
 It's unlikely that you'll want to provide a custom content negotiation scheme for REST framework, but you can do so if needed.  To implement a custom content negotiation scheme override `BaseContentNegotiation`.
