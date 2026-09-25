@@ -96,6 +96,34 @@ The default JSON encoding style can be altered using the `UNICODE_JSON` and `COM
 
 **.charset**: `None`
 
+### NDJSONRenderer
+
+Renders the response data as newline-delimited JSON, sending one JSON object per line.
+
+When a view returns iterable data, such as a queryset or a generator, the response is sent as a streaming response. Each item is serialized with the view's serializer and sent as a single line as soon as it is available, instead of first serializing the whole queryset into a list. Both synchronous and asynchronous iterables are supported, and are consumed lazily using their respective iteration protocol.
+
+    class UserExportView(generics.ListAPIView):
+        renderer_classes = [NDJSONRenderer]
+        queryset = User.objects.all()
+        serializer_class = UserSerializer
+
+        def list(self, request, *args, **kwargs):
+            # Returning the queryset directly lets the NDJSON renderer
+            # stream the response one record at a time.
+            return Response(self.get_queryset())
+
+A client requesting `Accept: application/x-ndjson` receives the first record as soon as it has been serialized. Responses negotiated to other renderers, such as `application/json`, are rendered as usual and are never streamed.
+
+Serialization errors raised before the first item has been sent are handled by the regular exception handling, so the client receives a standard error response. Errors raised once streaming has started terminate the stream, propagating the original exception.
+
+Non-iterable data, such as error responses, is rendered as a single JSON line.
+
+**.media_type**: `application/x-ndjson`
+
+**.format**: `'ndjson'`
+
+**.charset**: `utf-8`
+
 ### TemplateHTMLRenderer
 
 Renders data to HTML, using Django's standard template rendering.

@@ -440,6 +440,26 @@ class APIView(View):
             response.accepted_media_type = request.accepted_media_type
             response.renderer_context = self.get_renderer_context()
 
+            # Renderers supporting streaming (eg. `NDJSONRenderer`) may turn
+            # the response into a `StreamingHttpResponse`, serializing and
+            # sending iterable data one item at a time. Errors raised before
+            # the first item has been sent are handled by the regular
+            # exception handling, so the client still gets an error response.
+            renderer = request.accepted_renderer
+            should_stream = getattr(renderer, 'should_stream', None)
+            if should_stream is not None and should_stream(response.data):
+                try:
+                    response = renderer.stream_response(
+                        response,
+                        accepted_media_type=request.accepted_media_type,
+                        renderer_context=response.renderer_context,
+                    )
+                except Exception as exc:
+                    response = self.handle_exception(exc)
+                    response.accepted_renderer = request.accepted_renderer
+                    response.accepted_media_type = request.accepted_media_type
+                    response.renderer_context = self.get_renderer_context()
+
         # Add new vary headers to the response instead of overwriting.
         vary_headers = self.headers.pop('Vary', None)
         if vary_headers is not None:

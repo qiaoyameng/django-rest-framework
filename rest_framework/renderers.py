@@ -7,6 +7,7 @@ on the response, such as JSON encoded data or HTML output.
 REST framework also provides an HTML renderer that renders the browsable API.
 """
 
+import asyncio
 import contextlib
 import datetime
 import sys
@@ -15,6 +16,7 @@ from django import forms
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.paginator import Page
+from django.http import StreamingHttpResponse
 from django.template import engines, loader
 from django.urls import NoReverseMatch
 from django.utils.http import parse_header_parameters
@@ -105,6 +107,240 @@ class JSONRenderer(BaseRenderer):
         # See: https://gist.github.com/damncabbage/623b879af56f850a6ddc
         ret = ret.replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
         return ret.encode()
+
+
+class _AsyncLineStream:
+    """
+    Async iterable wrapper around an async generator of NDJSON lines.
+
+    Exposes a synchronous `.close()` in addition to the asynchronous
+    iteration protocol, so that `StreamingHttpResponse.close()` (which only
+    knows how to call synchronous closers) also releases the underlying
+    resources promptly.
+    """
+
+    def __init__(self, generator):
+        self._generator = generator
+
+    def __aiter__(self):
+        return self._generator
+
+    async def aclose(self):
+        await self._generator.aclose()
+
+    def close(self):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running event loop in this thread: close synchronously.
+            _run_coroutine_sync(self._generator.aclose())
+        else:
+            # Called from within a running event loop (eg. the ASGI handler
+            # closing the response): schedule the close instead of blocking.
+            asyncio.ensure_future(self._generator.aclose())
+
+
+def _run_coroutine_sync(coroutine):
+    """
+    Run a coroutine from synchronous code on a throwaway event loop.
+
+    Unlike `async_to_sync`, this does not perform `shutdown_asyncgens()` on
+    completion, so asynchronous generators that were started by the
+    coroutine (eg. the streaming source) keep being usable afterwards.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coroutine)
+    finally:
+        loop.close()
+
+
+class NDJSONRenderer(JSONRenderer):
+    """
+    Renderer which streams newline-delimited JSON (NDJSON).
+
+    When a view returns iterable data, such as a queryset or a generator,
+    the response is sent as a `StreamingHttpResponse` and each item is
+    serialized with the view's serializer and sent as a single JSON line,
+    instead of first serializing the whole queryset into a list.
+
+    Non-iterable data (eg. error responses) is rendered as a single line.
+    """
+    media_type = 'application/x-ndjson'
+    format = 'ndjson'
+    charset = 'utf-8'
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        """
+        Render `data` into a single line of NDJSON, returning a bytestring.
+
+        This is the non-streaming path, used for single objects such as
+        error responses. Iterable data is streamed by `.stream_response()`.
+        """
+        if data is None:
+            return b''
+        return self.render_line(data)
+
+    def render_line(self, data):
+        """
+        Render a single item as one NDJSON line. `json.dumps()` escapes any
+        newlines contained in the data, so each line is a valid,
+        self-contained JSON document.
+        """
+        separators = SHORT_SEPARATORS if self.compact else LONG_SEPARATORS
+        ret = json.dumps(
+            data, cls=self.encoder_class,
+            indent=None, ensure_ascii=self.ensure_ascii,
+            allow_nan=not self.strict, separators=separators
+        )
+        # Escape \u2028 and \u2029, which would otherwise break
+        # the one-document-per-line guarantee for javascript consumers.
+        ret = ret.replace(' ', '\\u2028').replace(' ', '\\u2029')
+        return ret.encode() + b'\n'
+
+    def should_stream(self, data):
+        """
+        Return `True` if `data` should be sent as a streaming response
+        rather than rendered in a single pass.
+        """
+        if data is None or isinstance(data, (dict, str, bytes)):
+            return False
+        return hasattr(data, '__iter__') or hasattr(data, '__aiter__')
+
+    def serialize_item(self, item, renderer_context):
+        """
+        Serialize a single item with the view's serializer and render it
+        as one NDJSON line. Items that are already plain data (eg. dicts)
+        are rendered as-is.
+        """
+        view = renderer_context.get('view')
+        if (
+            view is not None and
+            hasattr(view, 'get_serializer') and
+            not isinstance(item, dict)
+        ):
+            item = view.get_serializer(item).data
+        return self.render_line(item)
+
+    def stream_response(self, response, accepted_media_type=None, renderer_context=None):
+        """
+        Build a `StreamingHttpResponse` that serializes and sends the items
+        of `response.data` one line at a time.
+
+        The first item is pulled and serialized eagerly, so that a
+        serialization failure happening before any content has been sent
+        is raised here and can be handled by the view's regular exception
+        handling. Errors raised once streaming has started terminate the
+        stream, propagating the original exception.
+        """
+        renderer_context = renderer_context or {}
+        data = response.data
+
+        if hasattr(data, '__iter__'):
+            # Synchronous iterables are consumed synchronously. Note that
+            # querysets support both protocols; they take the sync path.
+            streaming_content = self._sync_stream(data, renderer_context)
+        else:
+            streaming_content = self._async_stream(data, renderer_context)
+
+        content_type = response.content_type
+        if content_type is None:
+            content_type = self.media_type
+            if self.charset is not None:
+                content_type = f'{content_type}; charset={self.charset}'
+
+        headers = {
+            name: value for name, value in response.items()
+            if name.lower() != 'content-type'
+        }
+        streamed = StreamingHttpResponse(
+            streaming_content, status=response.status_code,
+            content_type=content_type, headers=headers,
+        )
+        streamed.cookies.update(response.cookies)
+        return streamed
+
+    def _sync_stream(self, data, renderer_context):
+        """
+        Return a generator of NDJSON lines pulling lazily from a
+        synchronous iterable. The first line is produced eagerly.
+        """
+        iterator = iter(data)
+        try:
+            first_item = next(iterator)
+        except StopIteration:
+            self._close(iterator)
+            return iter(())
+        try:
+            first_line = self.serialize_item(first_item, renderer_context)
+        except BaseException:
+            self._close(iterator)
+            raise
+
+        def stream():
+            try:
+                yield first_line
+                for item in iterator:
+                    yield self.serialize_item(item, renderer_context)
+            finally:
+                # Released on exhaustion, client disconnect and
+                # serialization failure alike.
+                self._close(iterator)
+
+        return stream()
+
+    def _async_stream(self, data, renderer_context):
+        """
+        Return an async iterable of NDJSON lines pulling lazily from an
+        asynchronous iterable. The first line is produced eagerly, without
+        consuming the rest of the source.
+        """
+        aiterator = data.__aiter__()
+
+        async def pull_first_line():
+            try:
+                first_item = await aiterator.__anext__()
+            except StopAsyncIteration:
+                await self._aclose(aiterator)
+                return None
+            try:
+                return self.serialize_item(first_item, renderer_context)
+            except BaseException:
+                await self._aclose(aiterator)
+                raise
+
+        first_line = _run_coroutine_sync(pull_first_line())
+        if first_line is None:
+            return _empty_async_stream()
+
+        async def stream():
+            try:
+                yield first_line
+                async for item in aiterator:
+                    yield self.serialize_item(item, renderer_context)
+            finally:
+                # Released on exhaustion, client disconnect and
+                # serialization failure alike.
+                await self._aclose(aiterator)
+
+        return _AsyncLineStream(stream())
+
+    @staticmethod
+    def _close(iterator):
+        close = getattr(iterator, 'close', None)
+        if close is not None:
+            close()
+
+    @staticmethod
+    async def _aclose(aiterator):
+        aclose = getattr(aiterator, 'aclose', None)
+        if aclose is not None:
+            await aclose()
+
+
+async def _empty_async_stream():
+    return
+    yield
 
 
 class TemplateHTMLRenderer(BaseRenderer):
