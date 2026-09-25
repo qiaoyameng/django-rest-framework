@@ -1,11 +1,12 @@
 """
 Provides an APIView class that is the base of all views in REST framework.
 """
+from asgiref.sync import async_to_sync
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db import connections, models
 from django.http import Http404
-from django.http.response import HttpResponseBase
+from django.http.response import HttpResponseBase, StreamingHttpResponse
 from django.utils.cache import patch_vary_headers
 from django.utils.encoding import smart_str
 from django.views.decorators.csrf import csrf_exempt
@@ -67,6 +68,60 @@ def set_rollback():
     for db in connections.all(initialized_only=True):
         if db.settings_dict['ATOMIC_REQUESTS'] and db.in_atomic_block:
             db.set_rollback(True)
+
+
+async def _await_in_new_loop(awaitable):
+    """
+    Await an awaitable, for use with `async_to_sync`.
+
+    The awaitable itself must be created by the caller, in the calling
+    (synchronous) thread.
+    """
+    return await awaitable
+
+
+class _AsyncNDJSONStream:
+    """
+    Async-iterable wrapper that renders NDJSON lines from an async source,
+    one record at a time.
+
+    Also exposes a synchronous `close()`, because Django closes responses
+    synchronously once the client connection is gone. Closing releases the
+    underlying async source via its `aclose()` method, if it has one.
+    """
+
+    def __init__(self, source, first_line, renderer, serialize_item):
+        self.source = source
+        self.first_line = first_line
+        self.renderer = renderer
+        self.serialize_item = serialize_item
+        self._iterator = None
+
+    def __aiter__(self):
+        if self._iterator is None:
+            self._iterator = self._generate()
+        return self._iterator
+
+    async def _generate(self):
+        try:
+            if self.first_line is not None:
+                yield self.first_line
+            async for item in self.source:
+                yield self.renderer.render_line(self.serialize_item(item))
+        finally:
+            await self._aclose_source()
+
+    async def _aclose_source(self):
+        aclose = getattr(self.source, 'aclose', None)
+        if aclose is not None:
+            await aclose()
+
+    def close(self):
+        aclose = getattr(self.source, 'aclose', None)
+        if aclose is not None:
+            # Response closing happens in a synchronous context, so drive
+            # the async cleanup to completion from here.
+            async_to_sync(_await_in_new_loop)(aclose())
 
 
 def exception_handler(exc, context):
@@ -440,6 +495,17 @@ class APIView(View):
             response.accepted_media_type = request.accepted_media_type
             response.renderer_context = self.get_renderer_context()
 
+            if self.should_stream_ndjson(request, response):
+                try:
+                    response = self.finalize_ndjson_response(request, response)
+                except Exception as exc:
+                    # Errors occurring before the first record is sent are
+                    # handled like any other view exception.
+                    response = self.handle_exception(exc)
+                    response.accepted_renderer = request.accepted_renderer
+                    response.accepted_media_type = request.accepted_media_type
+                    response.renderer_context = self.get_renderer_context()
+
         # Add new vary headers to the response instead of overwriting.
         vary_headers = self.headers.pop('Vary', None)
         if vary_headers is not None:
@@ -449,6 +515,100 @@ class APIView(View):
             response[key] = value
 
         return response
+
+    # NDJSON streaming support
+
+    def should_stream_ndjson(self, request, response):
+        """
+        Return `True` if the response should be streamed as NDJSON, one
+        record per line, instead of being rendered in one go.
+        """
+        renderer = getattr(request, 'accepted_renderer', None)
+        if not getattr(renderer, 'streaming', False) or response.exception:
+            return False
+
+        data = response.data
+        if data is None or isinstance(data, (dict, str, bytes)):
+            return False
+
+        return hasattr(data, '__iter__') or hasattr(data, '__aiter__')
+
+    def get_ndjson_item_data(self, item):
+        """
+        Return the JSON-serializable data for a single streamed record.
+
+        Records that are not plain data already (such as model instances)
+        are serialized through the view's regular serializer, one record
+        at a time.
+        """
+        if item is None or isinstance(item, (dict, list, str, bytes, int, float, bool)):
+            return item
+
+        get_serializer = getattr(self, 'get_serializer', None)
+        if get_serializer is not None:
+            return get_serializer(item).data
+
+        return item
+
+    def finalize_ndjson_response(self, request, response):
+        """
+        Replace a `Response` carrying iterable data with a
+        `StreamingHttpResponse` that renders one NDJSON line per record.
+
+        The first record is pulled and serialized eagerly, so that errors
+        raised before any content is sent can still be routed through REST
+        framework's regular exception handling. Errors raised later
+        terminate the stream and propagate to the server as-is.
+        """
+        renderer = request.accepted_renderer
+        data = response.data
+
+        if hasattr(data, '__aiter__'):
+            source = data.__aiter__()
+            try:
+                first_item = async_to_sync(_await_in_new_loop)(source.__anext__())
+            except StopAsyncIteration:
+                first_line = None
+            else:
+                first_line = renderer.render_line(self.get_ndjson_item_data(first_item))
+            stream = _AsyncNDJSONStream(source, first_line, renderer, self.get_ndjson_item_data)
+        else:
+            source = iter(data)
+            try:
+                first_item = next(source)
+            except StopIteration:
+                first_line = None
+            else:
+                first_line = renderer.render_line(self.get_ndjson_item_data(first_item))
+            stream = self._ndjson_line_stream(source, first_line, renderer)
+
+        content_type = response.content_type
+        if content_type is None:
+            content_type = renderer.media_type
+            if renderer.charset:
+                content_type = f'{content_type}; charset={renderer.charset}'
+
+        streamed = StreamingHttpResponse(
+            stream, status=response.status_code, content_type=content_type
+        )
+        for name, value in response.items():
+            if name.lower() != 'content-type':
+                streamed[name] = value
+        return streamed
+
+    def _ndjson_line_stream(self, source, first_line, renderer):
+        try:
+            if first_line is not None:
+                yield first_line
+            for item in source:
+                yield renderer.render_line(self.get_ndjson_item_data(item))
+        finally:
+            # Release the source on normal exhaustion, client disconnect
+            # (Django closes the response, which closes this generator) and
+            # serialization failures.
+            close = getattr(source, 'close', None)
+            if close is not None:
+                close()
 
     def handle_exception(self, exc):
         """

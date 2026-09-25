@@ -107,6 +107,64 @@ class JSONRenderer(BaseRenderer):
         return ret.encode()
 
 
+class NDJSONRenderer(BaseRenderer):
+    """
+    Renderer which serializes records as newline-delimited JSON (NDJSON),
+    one JSON object per line.
+
+    When this renderer is selected by content negotiation and the response
+    data is an iterable of records (for example a queryset or a generator),
+    the view layer streams the records one line at a time using Django's
+    `StreamingHttpResponse`, instead of serializing everything up front.
+    See `APIView.finalize_response`.
+
+    Non-iterable data (such as the `{"detail": ...}` objects used for
+    errors) is rendered as a single JSON line.
+    """
+    media_type = 'application/x-ndjson'
+    format = 'ndjson'
+    charset = 'utf-8'
+    encoder_class = encoders.JSONEncoder
+    ensure_ascii = not api_settings.UNICODE_JSON
+    compact = api_settings.COMPACT_JSON
+    strict = api_settings.STRICT_JSON
+
+    # Marker used by `APIView.finalize_response` to detect that iterable
+    # response data should be streamed line by line.
+    streaming = True
+
+    def render_line(self, data):
+        """
+        Render a single record into one NDJSON line, as bytes.
+
+        `json.dumps` escapes any newlines contained in the data, so every
+        record is guaranteed to take up exactly one line.
+        """
+        ret = json.dumps(
+            data, cls=self.encoder_class,
+            ensure_ascii=self.ensure_ascii,
+            allow_nan=not self.strict,
+            separators=SHORT_SEPARATORS if self.compact else LONG_SEPARATORS
+        )
+
+        # As with `JSONRenderer`, fully escape \u2028 and \u2029.
+        ret = ret.replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+        return ret.encode('utf-8') + b'\n'
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        """
+        Non-streaming fallback, used for example when rendering errors
+        or other non-iterable data.
+        """
+        if data is None:
+            return b''
+
+        if isinstance(data, (dict, str)):
+            return self.render_line(data)
+
+        return b''.join(self.render_line(item) for item in data)
+
+
 class TemplateHTMLRenderer(BaseRenderer):
     """
     An HTML renderer for use with templates.
