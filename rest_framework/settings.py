@@ -85,6 +85,7 @@ DEFAULTS = {
 
     # Exception handling
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
+    'PERMISSION_RECORDING': False,
     'NON_FIELD_ERRORS_KEY': 'non_field_errors',
     'LIST_SERIALIZER_ERRORS_AS_DICT': True,
 

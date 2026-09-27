@@ -11,7 +11,7 @@ from django.utils.encoding import smart_str
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import View
 
-from rest_framework import exceptions, status
+from rest_framework import exceptions, permissions, status
 from rest_framework.compat import split_header_value
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -110,6 +110,7 @@ class APIView(View):
     authentication_classes = api_settings.DEFAULT_AUTHENTICATION_CLASSES
     throttle_classes = api_settings.DEFAULT_THROTTLE_CLASSES
     permission_classes = api_settings.DEFAULT_PERMISSION_CLASSES
+    permission_recording = api_settings.PERMISSION_RECORDING
     content_negotiation_class = api_settings.DEFAULT_CONTENT_NEGOTIATION_CLASS
     metadata_class = api_settings.DEFAULT_METADATA_CLASS
     versioning_class = api_settings.DEFAULT_VERSIONING_CLASS
@@ -333,8 +334,20 @@ class APIView(View):
         Check if the request should be permitted.
         Raises an appropriate exception if the request is not permitted.
         """
-        for permission in self.get_permissions():
-            if not permission.has_permission(request, self):
+        permission_recorder = request.permission_recorder
+        permission_instances = self.get_permissions()
+        if permission_recorder is not None:
+            stage = permission_recorder.start_view_check(permission_instances)
+
+        for index, permission in enumerate(permission_instances):
+            if permission_recorder is not None:
+                has_permission = permission_recorder.evaluate(
+                    permission, stage.checks[index], 'view', request, self
+                )
+            else:
+                has_permission = permission.has_permission(request, self)
+
+            if not has_permission:
                 self.permission_denied(
                     request,
                     message=getattr(permission, 'message', None),
@@ -346,8 +359,22 @@ class APIView(View):
         Check if the request should be permitted for a given object.
         Raises an appropriate exception if the request is not permitted.
         """
-        for permission in self.get_permissions():
-            if not permission.has_object_permission(request, self, obj):
+        permission_recorder = request.permission_recorder
+        permission_instances = self.get_permissions()
+        if permission_recorder is not None:
+            stage = permission_recorder.start_object_check(
+                permission_instances, obj
+            )
+
+        for index, permission in enumerate(permission_instances):
+            if permission_recorder is not None:
+                has_permission = permission_recorder.evaluate(
+                    permission, stage.checks[index], 'object', request, self, obj
+                )
+            else:
+                has_permission = permission.has_object_permission(request, self, obj)
+
+            if not has_permission:
                 self.permission_denied(
                     request,
                     message=getattr(permission, 'message', None),
@@ -393,13 +420,19 @@ class APIView(View):
         """
         parser_context = self.get_parser_context(request)
 
-        return Request(
+        request = Request(
             request,
             parsers=self.get_parsers(),
             authenticators=self.get_authenticators(),
             negotiator=self.get_content_negotiator(),
             parser_context=parser_context
         )
+        if self.permission_recording:
+            request.permission_recorder = permissions.PermissionRecorder()
+        return request
+
+    def get_permission_recorder(self):
+        return self.request.permission_recorder
 
     def initial(self, request, *args, **kwargs):
         """

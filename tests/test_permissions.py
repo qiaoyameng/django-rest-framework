@@ -1,18 +1,21 @@
 import base64
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest import mock
 
 import pytest
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser, Group, Permission, User
 from django.db import models
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import ResolverMatch
 
 from rest_framework import (
     HTTP_HEADER_ENCODING, authentication, generics, permissions, serializers,
     status, views
 )
+from rest_framework.response import Response
 from rest_framework.routers import DefaultRouter
 from rest_framework.test import APIRequestFactory
 from tests.models import BasicModel
@@ -776,3 +779,322 @@ class PermissionsCompositionTests(TestCase):
         ]
 
         assert filtered_permissions == expected_permissions
+
+
+class EventPermission(permissions.BasePermission):
+    label = None
+    message = 'permission message'
+    code = 'permission_code'
+
+    def has_permission(self, request, view):
+        request.events.append(f'{self.label}:view')
+        return request.permission_results[(self.label, 'view')]
+
+    def has_object_permission(self, request, view, obj):
+        request.events.append(f'{self.label}:object')
+        return request.permission_results[(self.label, 'object')]
+
+
+class EventA(EventPermission):
+    label = 'A'
+    message = 'A denied'
+    code = 'a_denied'
+
+
+class EventB(EventPermission):
+    label = 'B'
+    message = 'B denied'
+    code = 'b_denied'
+
+
+class EventC(EventPermission):
+    label = 'C'
+    message = 'C denied'
+    code = 'c_denied'
+
+
+class EventD(EventPermission):
+    label = 'D'
+    message = 'D denied'
+    code = 'd_denied'
+
+
+class ComplexPermissionView(views.APIView):
+    permission_classes = [(EventA | EventB) & (EventC | ~EventD)]
+    permission_recording = True
+
+    def get(self, request):
+        self.check_object_permissions(request, 'first')
+        self.check_object_permissions(request, 'second')
+        return Response({'ok': True})
+
+
+class ComplexPermissionViewWithoutRecording(ComplexPermissionView):
+    permission_recording = False
+
+
+class DenyLeaf(permissions.BasePermission):
+    message = 'Leaf denied'
+    code = 'leaf_denied'
+
+    def has_permission(self, request, view):
+        return False
+
+
+class DeniedCompositeView(views.APIView):
+    permission_classes = [EventA & DenyLeaf]
+    permission_recording = True
+    authentication_classes = []
+
+
+class ViewBoomPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        recording_test_requests.append(request)
+        raise RuntimeError('view boom')
+
+
+class ObjectBoomPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        recording_test_requests.append(request)
+        raise ValueError('object boom')
+
+
+class SilentPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        return True
+
+
+recording_test_requests = []
+
+
+class PermissionRecordingTests(TestCase):
+    expected_events = [
+        'A:view', 'C:view', 'D:view',
+        'A:view', 'A:object', 'C:view', 'D:view', 'D:object',
+        'A:view', 'A:object', 'C:view', 'D:view', 'D:object',
+    ]
+
+    def setUp(self):
+        recording_test_requests.clear()
+
+    def complex_request(self):
+        request = factory.get('/')
+        request.events = []
+        request.permission_results = {
+            ('A', 'view'): True,
+            ('A', 'object'): True,
+            ('B', 'view'): True,
+            ('B', 'object'): True,
+            ('C', 'view'): False,
+            ('C', 'object'): True,
+            ('D', 'view'): False,
+            ('D', 'object'): False,
+        }
+        return request
+
+    def leaf(self, node, label):
+        if node['kind'] == 'PERMISSION':
+            return node if node['permission'].endswith(label) else None
+        for child in node['children']:
+            found = self.leaf(child, label)
+            if found is not None:
+                return found
+
+    def leaf_at_stage(self, node, label, stage):
+        if node['kind'] == 'PERMISSION':
+            if node['permission'].endswith(label) and node['stage'] == stage:
+                return node
+        else:
+            for child in node['children']:
+                found = self.leaf_at_stage(child, label, stage)
+                if found is not None:
+                    return found
+
+    def evaluated_leaves(self, node):
+        if node['kind'] == 'PERMISSION':
+            return [node] if node['status'] == 'evaluated' else []
+        leaves = []
+        for child in node['children']:
+            leaves.extend(self.evaluated_leaves(child))
+        return leaves
+
+    def test_recording_preserves_results_and_call_order(self):
+        disabled_request = self.complex_request()
+        disabled_response = ComplexPermissionViewWithoutRecording.as_view()(disabled_request)
+
+        enabled_request = self.complex_request()
+        enabled_response = ComplexPermissionView.as_view()(enabled_request)
+
+        assert disabled_response.status_code == status.HTTP_200_OK
+        assert enabled_response.status_code == status.HTTP_200_OK
+        assert disabled_request.events == self.expected_events
+        assert enabled_request.events == self.expected_events
+        assert disabled_response.renderer_context['request'].permission_recorder is None
+
+        recorder = enabled_response.renderer_context['request'].permission_recorder
+        records = recorder.to_dict()
+        assert [record['stage'] for record in records] == ['view', 'object', 'object']
+        assert records[1]['object'] == "'first'"
+        assert records[2]['object'] == "'second'"
+
+        view_root = records[0]['checks'][0]
+        assert view_root['kind'] == 'AND'
+        assert view_root['result'] is True
+        assert self.leaf(view_root, 'A')['result'] is True
+        assert self.leaf(view_root, 'B')['status'] == 'unevaluated'
+        assert self.leaf(view_root, 'B')['result'] is None
+        assert self.leaf(view_root, 'C')['result'] is False
+        assert self.leaf(view_root, 'D')['result'] is False
+        assert self.leaf(view_root, 'D')['message'] == 'D denied'
+        assert self.leaf(view_root, 'D')['code'] == 'd_denied'
+
+        orders = [
+            leaf['order']
+            for record in records
+            for leaf in self.evaluated_leaves(record['checks'][0])
+        ]
+        assert orders == list(range(len(self.expected_events)))
+
+        for record in records[1:]:
+            object_root = record['checks'][0]
+            first_or, second_or = object_root['children']
+            assert first_or['kind'] == 'OR'
+            assert first_or['children'][0]['synthetic'] is True
+            assert self.leaf_at_stage(first_or, 'A', 'view')['result'] is True
+            assert self.leaf_at_stage(first_or, 'A', 'object')['result'] is True
+            assert self.leaf(first_or, 'B')['status'] == 'unevaluated'
+
+            assert second_or['children'][0]['synthetic'] is True
+            assert self.leaf_at_stage(second_or, 'C', 'view')['result'] is False
+            assert self.leaf_at_stage(second_or, 'C', 'object')['status'] == 'unevaluated'
+            assert self.leaf_at_stage(second_or, 'D', 'view')['result'] is False
+            assert self.leaf_at_stage(second_or, 'D', 'object')['result'] is False
+
+    def test_default_403_response_is_unchanged_and_records_leaf_detail(self):
+        request = self.complex_request()
+        response = DeniedCompositeView.as_view()(request)
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert str(response.data['detail']) == (
+            'You do not have permission to perform this action.'
+        )
+        assert response.data['detail'].code == 'permission_denied'
+
+        recorder = response.renderer_context['request'].permission_recorder
+        root = recorder.to_dict()[0]['checks'][0]
+        deny_leaf = self.leaf(root, 'DenyLeaf')
+        assert deny_leaf['result'] is False
+        assert deny_leaf['message'] == 'Leaf denied'
+        assert deny_leaf['code'] == 'leaf_denied'
+
+    def test_exception_handler_can_read_recorder_without_changing_response(self):
+        def recording_exception_handler(exc, context):
+            self.handler_records = context['request'].permission_recorder.to_dict()
+            return views.exception_handler(exc, context)
+
+        original_handler = views.api_settings.EXCEPTION_HANDLER
+        views.api_settings.EXCEPTION_HANDLER = recording_exception_handler
+        try:
+            response = DeniedCompositeView.as_view()(self.complex_request())
+        finally:
+            views.api_settings.EXCEPTION_HANDLER = original_handler
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert str(response.data['detail']) == (
+            'You do not have permission to perform this action.'
+        )
+        root = self.handler_records[0]['checks'][0]
+        assert self.leaf(root, 'DenyLeaf')['code'] == 'leaf_denied'
+
+    @override_settings(REST_FRAMEWORK={'PERMISSION_RECORDING': True})
+    def test_global_setting_enables_recorder(self):
+        class GlobalRecordingView(views.APIView):
+            authentication_classes = []
+            permission_classes = [DenyLeaf]
+
+            permission_recording = views.api_settings.PERMISSION_RECORDING
+
+        response = GlobalRecordingView.as_view()(factory.get('/'))
+        recorder = response.renderer_context['request'].permission_recorder
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert recorder.to_dict()[0]['checks'][0]['permission'].endswith('DenyLeaf')
+
+    def test_recorder_can_evaluate_directly_without_extra_invocations(self):
+        recorder = permissions.PermissionRecorder()
+        request = self.complex_request()
+        permission = (EventA | EventB) & (EventC | ~EventD)
+
+        result = recorder.evaluate_permission(permission(), request, None)
+
+        assert result is True
+        assert request.events == ['A:view', 'C:view', 'D:view']
+        root = recorder.to_dict()[0]['checks'][0]
+        assert self.leaf(root, 'B')['status'] == 'unevaluated'
+
+    def test_view_exception_is_preserved_and_short_circuit_is_recorded(self):
+        class BoomView(views.APIView):
+            permission_classes = [ViewBoomPermission & SilentPermission]
+            permission_recording = True
+
+        request = factory.get('/')
+        with pytest.raises(RuntimeError, match='view boom'):
+            BoomView.as_view()(request)
+
+        root = recording_test_requests[-1].permission_recorder.to_dict()[0]['checks'][0]
+        boom_leaf = root['children'][0]
+        silent_leaf = root['children'][1]
+        assert root['status'] == 'error'
+        assert boom_leaf['status'] == 'error'
+        assert boom_leaf['exception']['type'] == 'RuntimeError'
+        assert boom_leaf['exception']['message'] == 'view boom'
+        assert silent_leaf['status'] == 'unevaluated'
+
+    def test_object_exception_is_preserved(self):
+        class BoomObjectView(views.APIView):
+            permission_classes = [ObjectBoomPermission]
+            permission_recording = True
+
+            def get(self, request):
+                self.check_object_permissions(request, None)
+
+        request = factory.get('/')
+        with pytest.raises(ValueError, match='object boom'):
+            BoomObjectView.as_view()(request)
+
+        root = recording_test_requests[-1].permission_recorder.to_dict()[1]['checks'][0]
+        assert root['status'] == 'error'
+        assert root['exception']['type'] == 'ValueError'
+        assert root['exception']['message'] == 'object boom'
+
+    def test_records_are_isolated_between_concurrent_requests(self):
+        barrier = Barrier(8)
+
+        def make_request(index):
+            request = self.complex_request()
+            request.permission_results[('A', 'view')] = True
+            barrier.wait()
+            response = ComplexPermissionView.as_view()(request)
+            recorder = response.renderer_context['request'].permission_recorder
+            return (
+                response.status_code,
+                request.events,
+                recorder.to_dict(),
+                recorder,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(make_request, range(8)))
+
+        assert len({id(result[3]) for result in results}) == 8
+        for status_code, events, records, recorder in results:
+            assert status_code == status.HTTP_200_OK
+            assert events == self.expected_events
+            assert len(records) == 3
+            assert {record['stage'] for record in records} == {'view', 'object'}

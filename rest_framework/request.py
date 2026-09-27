@@ -120,6 +120,7 @@ def clone_request(request, method):
         ret.version = request.version
     if hasattr(request, 'versioning_scheme'):
         ret.versioning_scheme = request.versioning_scheme
+    ret.permission_recorder = request.permission_recorder
     return ret
 
 
@@ -162,6 +163,7 @@ class Request:
         self.authenticators = authenticators or ()
         self.negotiator = negotiator or self._default_negotiator()
         self.parser_context = parser_context
+        self._permission_recorder = None
         self._data = Empty
         self._files = Empty
         self._full_data = Empty
@@ -192,6 +194,14 @@ class Request:
 
     def _default_negotiator(self):
         return api_settings.DEFAULT_CONTENT_NEGOTIATION_CLASS()
+
+    @property
+    def permission_recorder(self):
+        return self._permission_recorder
+
+    @permission_recorder.setter
+    def permission_recorder(self, recorder):
+        self._permission_recorder = recorder
 
     @property
     def content_type(self):

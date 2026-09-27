@@ -142,6 +142,10 @@ Provided they inherit from `rest_framework.permissions.BasePermission`, permissi
 
     Operators follow the same precedence and associativity rules as standard logical operators (`~` highest, then `&`, then `|`).
 
+Set `permission_recording = True` on a view, or set `PERMISSION_RECORDING` to `True` globally, to record each permission evaluation for the lifetime of that request. The recorder is available as `request.permission_recorder`, including in exception handlers and logging.
+
+Each record preserves the `AND`, `OR`, and `NOT` structure, leaf `message` and `code`, evaluated results, short-circuited branches marked as `unevaluated`, and any original exception raised by a permission method. Object checks keep the existing `OR` rule, where each operand's view permission is checked before that operand's object permission. Recording is diagnostic only; the default response format and permission method call order are unchanged.
+
 
 ## API Reference
 

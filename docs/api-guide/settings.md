@@ -91,6 +91,12 @@ A list or tuple of throttle classes, that determines the default set of throttle
 
 Default: `[]`
 
+#### PERMISSION_RECORDING
+
+When set to `True`, each request gets a `request.permission_recorder` containing structured view and object permission evaluations. Short-circuited branches remain marked as unevaluated, and exceptions raised by permission methods are recorded without changing the response format.
+
+Default: `False`
+
 #### DEFAULT_CONTENT_NEGOTIATION_CLASS
 
 A content negotiation class, that determines how a renderer is selected for the response, given an incoming request.

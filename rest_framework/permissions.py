@@ -1,11 +1,249 @@
 """
 Provides a set of pluggable permission policies.
 """
+from dataclasses import dataclass, field
+
 from django.http import Http404
 
 from rest_framework import exceptions
 
 SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
+
+UNEVALUATED = 'unevaluated'
+EVALUATED = 'evaluated'
+ERROR = 'error'
+
+
+@dataclass
+class PermissionEvaluation:
+    kind: str
+    stage: str | None = None
+    permission: str | None = None
+    status: str = UNEVALUATED
+    result: bool | None = None
+    value: object = None
+    message: str | None = None
+    code: str | None = None
+    order: int | None = None
+    exception: Exception | None = None
+    synthetic: bool = False
+    children: list['PermissionEvaluation'] = field(default_factory=list)
+
+    def to_dict(self):
+        exception = None
+        if self.exception is not None:
+            exception = {
+                'type': self.exception.__class__.__name__,
+                'message': str(self.exception),
+            }
+
+        return {
+            'kind': self.kind,
+            'stage': self.stage,
+            'permission': self.permission,
+            'status': self.status,
+            'result': self.result,
+            'value': self.value,
+            'message': self.message,
+            'code': self.code,
+            'order': self.order,
+            'exception': exception,
+            'synthetic': self.synthetic,
+            'children': [child.to_dict() for child in self.children],
+        }
+
+
+@dataclass
+class PermissionStageRecord:
+    stage: str
+    checks: list[PermissionEvaluation]
+    object_repr: str | None = None
+
+    def to_dict(self):
+        data = {
+            'stage': self.stage,
+            'checks': [check.to_dict() for check in self.checks],
+        }
+        if self.object_repr is not None:
+            data['object'] = self.object_repr
+        return data
+
+
+class PermissionRecorder:
+    def __init__(self):
+        self.records: list[PermissionStageRecord] = []
+        self._next_order = 0
+
+    def start_view_check(self, permissions):
+        stage = PermissionStageRecord(
+            stage='view',
+            checks=[
+                self._build_node(permission, 'view')
+                for permission in permissions
+            ],
+        )
+        self.records.append(stage)
+        return stage
+
+    def start_object_check(self, permissions, obj):
+        stage = PermissionStageRecord(
+            stage='object',
+            object_repr=repr(obj),
+            checks=[
+                self._build_node(permission, 'object')
+                for permission in permissions
+            ],
+        )
+        self.records.append(stage)
+        return stage
+
+    def evaluate_permission(self, permission, request, view):
+        node = self._build_node(permission, 'view')
+        self.records.append(PermissionStageRecord(stage='view', checks=[node]))
+        return self._evaluate(permission, node, 'view', request, view)
+
+    def evaluate_object_permission(self, permission, request, view, obj):
+        node = self._build_node(permission, 'object')
+        self.records.append(
+            PermissionStageRecord(stage='object', object_repr=repr(obj), checks=[node])
+        )
+        return self._evaluate(permission, node, 'object', request, view, obj)
+
+    def evaluate(self, permission, node, stage, request, view, obj=None):
+        return self._evaluate(permission, node, stage, request, view, obj)
+
+    def _build_node(self, permission, stage):
+        if isinstance(permission, AND):
+            return PermissionEvaluation(
+                kind='AND',
+                stage=stage,
+                children=[
+                    self._build_node(permission.op1, stage),
+                    self._build_node(permission.op2, stage),
+                ],
+            )
+        if isinstance(permission, NOT):
+            return PermissionEvaluation(
+                kind='NOT',
+                stage=stage,
+                children=[self._build_node(permission.op1, stage)],
+            )
+        if isinstance(permission, OR):
+            if stage == 'view':
+                children = [
+                    self._build_node(permission.op1, 'view'),
+                    self._build_node(permission.op2, 'view'),
+                ]
+            else:
+                children = [
+                    self._build_or_object_branch(permission.op1),
+                    self._build_or_object_branch(permission.op2),
+                ]
+            return PermissionEvaluation(kind='OR', stage=stage, children=children)
+
+        return PermissionEvaluation(
+            kind='PERMISSION',
+            stage=stage,
+            permission=self._permission_name(permission),
+            message=getattr(permission, 'message', None),
+            code=getattr(permission, 'code', None),
+        )
+
+    def _build_or_object_branch(self, operand):
+        return PermissionEvaluation(
+            kind='AND',
+            stage='object',
+            synthetic=True,
+            children=[
+                self._build_node(operand, 'view'),
+                self._build_node(operand, 'object'),
+            ],
+        )
+
+    def _permission_name(self, permission):
+        permission_class = type(permission)
+        return f'{permission_class.__module__}.{permission_class.__qualname__}'
+
+    def _evaluate(self, permission, node, stage, request, view, obj=None):
+        try:
+            value = self._dispatch(permission, node, stage, request, view, obj)
+        except Exception as exc:
+            node.status = ERROR
+            node.exception = exc
+            raise
+        node.status = EVALUATED
+        node.value = value
+        node.result = bool(value)
+        return value
+
+    def _dispatch(self, permission, node, stage, request, view, obj):
+        if node.kind == 'PERMISSION':
+            return self._evaluate_leaf(permission, node, stage, request, view, obj)
+        if node.kind == 'NOT':
+            return not self._evaluate(
+                permission.op1, node.children[0], stage, request, view, obj
+            )
+        if node.kind == 'AND':
+            left = self._evaluate(
+                permission.op1, node.children[0], stage, request, view, obj
+            )
+            if not left:
+                return left
+            return self._evaluate(
+                permission.op2, node.children[1], stage, request, view, obj
+            )
+        if stage == 'view':
+            left = self._evaluate(
+                permission.op1, node.children[0], 'view', request, view
+            )
+            if left:
+                return left
+            return self._evaluate(
+                permission.op2, node.children[1], 'view', request, view
+            )
+
+        first_branch = self._evaluate_or_object_branch(
+            permission.op1, node.children[0], request, view, obj
+        )
+        if first_branch:
+            return first_branch
+        return self._evaluate_or_object_branch(
+            permission.op2, node.children[1], request, view, obj
+        )
+
+    def _evaluate_or_object_branch(self, operand, node, request, view, obj):
+        try:
+            view_result = self._evaluate(
+                operand, node.children[0], 'view', request, view
+            )
+            if not view_result:
+                value = view_result
+            else:
+                value = self._evaluate(
+                    operand, node.children[1], 'object', request, view, obj
+                )
+        except Exception as exc:
+            node.status = ERROR
+            node.exception = exc
+            raise
+        node.status = EVALUATED
+        node.value = value
+        node.result = bool(value)
+        return value
+
+    def _evaluate_leaf(self, permission, node, stage, request, view, obj):
+        node.order = self._next_order
+        self._next_order += 1
+        if stage == 'view':
+            value = permission.has_permission(request, view)
+        else:
+            value = permission.has_object_permission(request, view, obj)
+        node.message = getattr(permission, 'message', None)
+        node.code = getattr(permission, 'code', None)
+        return value
+
+    def to_dict(self):
+        return [record.to_dict() for record in self.records]
 
 
 class OperationHolderMixin:
