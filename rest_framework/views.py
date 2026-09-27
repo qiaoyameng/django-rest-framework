@@ -13,6 +13,7 @@ from django.views.generic import View
 
 from rest_framework import exceptions, status
 from rest_framework.compat import split_header_value
+from rest_framework.permission_trace import get_permission_tracer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.schemas import DefaultSchema
@@ -333,6 +334,17 @@ class APIView(View):
         Check if the request should be permitted.
         Raises an appropriate exception if the request is not permitted.
         """
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.trace_phase('view'):
+                for permission in self.get_permissions():
+                    if not tracer.evaluate(permission, 'has_permission', request, self):
+                        self.permission_denied(
+                            request,
+                            message=getattr(permission, 'message', None),
+                            code=getattr(permission, 'code', None)
+                        )
+            return
         for permission in self.get_permissions():
             if not permission.has_permission(request, self):
                 self.permission_denied(
@@ -346,6 +358,17 @@ class APIView(View):
         Check if the request should be permitted for a given object.
         Raises an appropriate exception if the request is not permitted.
         """
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.trace_phase('object', obj):
+                for permission in self.get_permissions():
+                    if not tracer.evaluate(permission, 'has_object_permission', request, self, obj):
+                        self.permission_denied(
+                            request,
+                            message=getattr(permission, 'message', None),
+                            code=getattr(permission, 'code', None)
+                        )
+            return
         for permission in self.get_permissions():
             if not permission.has_object_permission(request, self, obj):
                 self.permission_denied(

@@ -268,6 +268,28 @@ Note that the generic views will check the appropriate object level permissions,
 
 Also note that the generic views will only check the object-level permissions for views that retrieve a single model instance.  If you require object-level filtering of list views, you'll need to filter the queryset separately.  See the [filtering documentation][filtering] for more details.
 
+## Tracing permission evaluation
+
+When composed permissions such as `IsAdmin | (IsOwner & IsActive)` reject a request, it can be hard to tell which operand denied it. REST framework provides an optional, per-request trace of permission evaluation in the `rest_framework.permission_trace` module.
+
+Tracing is strictly opt-in. Enable it for a request before permissions are checked, for example in `initial()`:
+
+    from rest_framework import permission_trace
+
+    class MyView(APIView):
+        def initial(self, request, *args, **kwargs):
+            if request.headers.get('Debug-Permissions'):
+                permission_trace.enable_permission_tracing(request)
+            super().initial(request, *args, **kwargs)
+
+The recorded trace can then be read from an exception handler or logging code:
+
+    trace = permission_trace.get_permission_trace(request)
+
+`get_permission_trace()` returns `None` when tracing is not enabled, and otherwise a plain dict describing each check. The trace follows the real short-circuit evaluation exactly: no permission method is ever called an extra time, and branches skipped by short-circuiting are recorded with the status `'unevaluated'`. View-level checks and object-level checks are recorded as separate phases, and each phase contains the `AND`/`OR`/`NOT` structure, the result of every leaf permission that actually ran, and each leaf permission's `message` and `code`. If a permission method raises, the original exception propagates unchanged and the node is recorded with the status `'raised'`.
+
+The trace is stored on the request only; enabling it does not change the allow/deny outcome or the default response format.
+
 ## Overview of access restriction methods
 
 REST framework offers three different methods to customize access restrictions on a case-by-case basis. These apply in different scenarios and have different effects and limitations.

@@ -4,6 +4,7 @@ Provides a set of pluggable permission policies.
 from django.http import Http404
 
 from rest_framework import exceptions
+from rest_framework.permission_trace import ComposedPermission, get_permission_tracer
 
 SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
 
@@ -58,36 +59,89 @@ class OperandHolder(OperationHolderMixin):
         return hash((self.operator_class, self.op1_class, self.op2_class))
 
 
-class AND:
+class AND(ComposedPermission):
     def __init__(self, op1, op2):
         self.op1 = op1
         self.op2 = op2
 
     def has_permission(self, request, view):
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.composite('and') as node:
+                op1_result = tracer.evaluate(self.op1, 'has_permission', request, view)
+                if not op1_result:
+                    tracer.unevaluated(self.op2, 'has_permission')
+                    node.result = False
+                    return op1_result
+                op2_result = tracer.evaluate(self.op2, 'has_permission', request, view)
+                node.result = bool(op2_result)
+                return op2_result
         return (
             self.op1.has_permission(request, view) and
             self.op2.has_permission(request, view)
         )
 
     def has_object_permission(self, request, view, obj):
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.composite('and') as node:
+                op1_result = tracer.evaluate(self.op1, 'has_object_permission', request, view, obj)
+                if not op1_result:
+                    tracer.unevaluated(self.op2, 'has_object_permission')
+                    node.result = False
+                    return op1_result
+                op2_result = tracer.evaluate(self.op2, 'has_object_permission', request, view, obj)
+                node.result = bool(op2_result)
+                return op2_result
         return (
             self.op1.has_object_permission(request, view, obj) and
             self.op2.has_object_permission(request, view, obj)
         )
 
 
-class OR:
+class OR(ComposedPermission):
     def __init__(self, op1, op2):
         self.op1 = op1
         self.op2 = op2
 
     def has_permission(self, request, view):
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.composite('or') as node:
+                op1_result = tracer.evaluate(self.op1, 'has_permission', request, view)
+                if op1_result:
+                    tracer.unevaluated(self.op2, 'has_permission')
+                    node.result = True
+                    return op1_result
+                op2_result = tracer.evaluate(self.op2, 'has_permission', request, view)
+                node.result = bool(op2_result)
+                return op2_result
         return (
             self.op1.has_permission(request, view) or
             self.op2.has_permission(request, view)
         )
 
     def has_object_permission(self, request, view, obj):
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.composite('or') as node:
+                op1_result = tracer.evaluate(self.op1, 'has_permission', request, view)
+                if op1_result:
+                    op1_result = tracer.evaluate(self.op1, 'has_object_permission', request, view, obj)
+                else:
+                    tracer.unevaluated(self.op1, 'has_object_permission')
+                if op1_result:
+                    tracer.unevaluated(self.op2, 'has_permission')
+                    tracer.unevaluated(self.op2, 'has_object_permission')
+                    node.result = True
+                    return op1_result
+                op2_result = tracer.evaluate(self.op2, 'has_permission', request, view)
+                if op2_result:
+                    op2_result = tracer.evaluate(self.op2, 'has_object_permission', request, view, obj)
+                else:
+                    tracer.unevaluated(self.op2, 'has_object_permission')
+                node.result = bool(op2_result)
+                return op2_result
         return (
             self.op1.has_permission(request, view)
             and self.op1.has_object_permission(request, view, obj)
@@ -97,14 +151,24 @@ class OR:
         )
 
 
-class NOT:
+class NOT(ComposedPermission):
     def __init__(self, op1):
         self.op1 = op1
 
     def has_permission(self, request, view):
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.composite('not') as node:
+                node.result = not tracer.evaluate(self.op1, 'has_permission', request, view)
+                return node.result
         return not self.op1.has_permission(request, view)
 
     def has_object_permission(self, request, view, obj):
+        tracer = get_permission_tracer(request)
+        if tracer is not None:
+            with tracer.composite('not') as node:
+                node.result = not tracer.evaluate(self.op1, 'has_object_permission', request, view, obj)
+                return node.result
         return not self.op1.has_object_permission(request, view, obj)
 
 
